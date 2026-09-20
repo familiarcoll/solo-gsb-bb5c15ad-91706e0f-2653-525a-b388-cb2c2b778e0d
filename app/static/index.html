@@ -572,6 +572,72 @@ X999, 2026-09-18 08:10:00, 中心公园, 进"></textarea>
       </div>
     </section>
 
+    <!-- 通票购买策略回测 -->
+    <section class="card" id="sec-pass">
+      <h2>14. 通票购买策略回测</h2>
+      <p class="hint">基于<strong>最近一次核验生成的账单</strong>（第 7 区），按卡号比较
+        「按次实扣」与「购买通票」：每行一种通票 <code>名称, 价格, 连续有效运营日数</code>，
+        并选择运营日起止（闭区间）。通票自选定运营日起<strong>连续覆盖</strong>其有效运营日内的
+        全部行程，<strong>不因中间无行程暂停</strong>。系统用<strong>动态规划</strong>求每张卡
+        总支出最低的购买序列，同价时依次选择<strong>通票更少、首次购买日更早、名称字典序更小</strong>
+        的方案。回测<strong>全程只读</strong>：不修改记录、配置或账单；尚未成功核验（无有效账单）时
+        无法回测。</p>
+      <textarea id="pass-text" rows="4" placeholder="一日票, 6.00, 1
+三日票, 15.00, 3
+周票, 30.00, 7"></textarea>
+      <div class="form-grid">
+        <label>运营日起始日期（含）
+          <input type="date" id="pass-start" />
+        </label>
+        <label>运营日结束日期（含）
+          <input type="date" id="pass-end" />
+        </label>
+      </div>
+      <div class="row-actions">
+        <button class="btn btn-primary" id="btn-pass" type="button">🎫 运行通票回测</button>
+        <span id="pass-status" class="status"></span>
+      </div>
+
+      <div id="pass-errors" class="errors-panel" hidden>
+        <h3>❌ 无法执行通票回测 —— 请先处理以下问题（记录、配置与账单均未改动）</h3>
+        <ul id="pass-errors-list"></ul>
+      </div>
+
+      <div id="pass-result" class="audit-result" hidden>
+        <div id="pass-summary" class="audit-summary"></div>
+
+        <h3>按卡汇总</h3>
+        <div class="table-wrap">
+          <table id="pass-cards-table">
+            <thead>
+              <tr>
+                <th>卡号</th><th>行程数</th><th>基准支出（按次实扣）</th>
+                <th>通票费</th><th>未覆盖按次</th><th>通票方案支出</th>
+                <th>节省</th><th>购买次数</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+
+        <div id="pass-purchases-block" hidden>
+          <h3>逐次购买明细</h3>
+          <div class="table-wrap">
+            <table id="pass-purchases-table">
+              <thead>
+                <tr>
+                  <th>卡号</th><th>#</th><th>购买运营日</th><th>通票</th>
+                  <th>价格（元）</th><th>有效天数</th><th>覆盖运营日起止</th>
+                  <th>覆盖行程数</th><th>覆盖行程按次合计（元）</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <footer class="footer">
       FastAPI + SQLite + 原生前端 · 数据保存在容器 /data 卷 ·
       <a href="/docs" target="_blank">API 文档</a>

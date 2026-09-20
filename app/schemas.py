@@ -79,3 +79,16 @@ class GateQueueIn(BaseModel):
         description="每桶通行能力（人次），不小于 1 的整数")
     max_extra_buckets: float = Field(
         description="最后一笔到达之后最多续算的空桶数，不小于 0 的整数")
+
+
+class PassBacktestIn(BaseModel):
+    """通票购买策略回测参数。
+
+    不在此处做数值约束：非法日期 / 产品应走核心层校验，
+    返回与其他接口一致的定位错误（HTTP 422）。
+    """
+    passes_text: str = Field(
+        default="",
+        description="通票产品文本，每行：名称, 价格（元）, 连续有效运营日数")
+    start_day: str = Field(description="运营日起始日期 YYYY-MM-DD（闭区间）")
+    end_day: str = Field(description="运营日结束日期 YYYY-MM-DD（闭区间）")

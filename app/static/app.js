@@ -1480,6 +1480,137 @@ function exportGqCsv() {
   toast("已导出逐桶排队推演结果（CSV，UTF-8 BOM）");
 }
 
+/* ---------------- 14. 通票购买策略回测（只读） ---------------- */
+
+function renderPassErrors(errors) {
+  const ul = $("pass-errors-list");
+  ul.innerHTML = "";
+  for (const e of errors) ul.appendChild(renderErrorLi(e));
+  $("pass-errors").hidden = false;
+  $("pass-result").hidden = true;
+}
+
+function renderPassBacktest(data) {
+  $("pass-errors").hidden = true;
+  $("pass-result").hidden = false;
+
+  const summary = $("pass-summary");
+  if (!data.card_count) {
+    summary.innerHTML =
+      `运营日 <strong>${data.start_day} ～ ${data.end_day}</strong>` +
+      `（${data.day_count} 天，账单核验时间 ${data.last_verified_at || "未知"}）` +
+      `内没有任何行程账单，请调整运营日范围。<br>` +
+      `<span class="sub">回测全程只读：未修改记录、配置或账单。</span>`;
+  } else {
+    summary.innerHTML =
+      `运营日 <strong>${data.start_day} ～ ${data.end_day}</strong>` +
+      `（${data.day_count} 天）· 账单核验时间 <strong>${data.last_verified_at}</strong> · ` +
+      `范围内 <strong>${data.trip_count}</strong> 笔行程 / ` +
+      `<strong>${data.card_count}</strong> 张卡：` +
+      `基准支出 <strong>${yuan(data.baseline_total)}</strong> 元 → ` +
+      `通票方案支出 <strong>${yuan(data.pass_total)}</strong> 元` +
+      `（通票费 ${yuan(data.pass_cost_total)} ＋ 未覆盖按次 ` +
+      `${yuan(data.uncovered_total)}），` +
+      `<span class="delta-down">节省 ${yuan(data.saving_total)} 元</span>。<br>` +
+      `<span class="sub">通票自购买运营日起连续覆盖其有效运营日内全部行程，不因中间无行程暂停；` +
+      `同价时依次按通票更少、首次购买日更早、名称字典序更小破同分；` +
+      `回测全程只读：未修改记录、配置或账单。</span>`;
+  }
+
+  // 按卡汇总
+  const tb = $("pass-cards-table").querySelector("tbody");
+  tb.innerHTML = "";
+  const cards = data.cards || [];
+  for (const c of cards) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${escapeHtml(c.card)}</td>
+      <td class="num">${c.trip_count}</td>
+      <td class="num">${yuan(c.baseline_total)}</td>
+      <td class="num">${yuan(c.pass_cost)}</td>
+      <td class="num">${yuan(c.uncovered_total)}</td>
+      <td class="num charge">${yuan(c.pass_total)}</td>
+      <td class="num ${c.saving > 0 ? "delta-down" : "delta-zero"}">${yuan(c.saving)}</td>
+      <td class="num">${c.purchase_count}</td>`;
+    tb.appendChild(tr);
+  }
+  if (!cards.length) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td colspan="8" class="od-empty">所选运营日范围内没有行程账单。</td>`;
+    tb.appendChild(tr);
+  }
+
+  // 逐次购买明细（全部卡合并，按卡号 + 购买次序）
+  const rows = [];
+  for (const c of cards) {
+    (c.purchases || []).forEach((p, idx) => {
+      rows.push(Object.assign({ card: c.card, idx: idx + 1 }, p));
+    });
+  }
+  const pBlock = $("pass-purchases-block");
+  pBlock.hidden = rows.length === 0;
+  const ptb = $("pass-purchases-table").querySelector("tbody");
+  ptb.innerHTML = "";
+  for (const p of rows) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${escapeHtml(p.card)}</td>
+      <td class="num">${p.idx}</td>
+      <td>${p.day}</td>
+      <td>${escapeHtml(p.name)}</td>
+      <td class="num">${yuan(p.price)}</td>
+      <td class="num">${p.valid_days}</td>
+      <td>${p.cover_start} ～ ${p.cover_end}` +
+      `<span class="sub">（${p.covered_days} 天）</span></td>
+      <td class="num">${p.covered_trip_count}</td>
+      <td class="num">${yuan(p.covered_baseline)}</td>`;
+    ptb.appendChild(tr);
+  }
+}
+
+async function runPassBacktest() {
+  const status = $("pass-status");
+  const body = {
+    passes_text: $("pass-text").value,
+    start_day: $("pass-start").value,
+    end_day: $("pass-end").value,
+  };
+  if (!body.start_day || !body.end_day) {
+    status.textContent = "请先选择运营日起止日期";
+    status.className = "status bad";
+    return;
+  }
+  status.textContent = "回测中…";
+  status.className = "status";
+  $("pass-errors").hidden = true;
+  $("pass-result").hidden = true;
+  try {
+    const data = await api("/api/pass-backtest", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    renderPassBacktest(data);
+    status.textContent = data.card_count
+      ? `回测完成：${data.card_count} 张卡，节省合计 ${yuan(data.saving_total)} 元` +
+        "（只读，数据均未改动）"
+      : "回测完成：所选运营日范围内没有行程账单（只读，数据均未改动）";
+    status.className = "status ok";
+    toast("通票回测完成（只读，未保存任何改动）");
+  } catch (e) {
+    const errors = (e.payload && e.payload.errors) || [];
+    if (errors.length) {
+      renderPassErrors(errors);
+      status.textContent = errors[0].code === "NO_BILLS"
+        ? "没有可用的核验账单，请先在「7. 核验结果」成功运行核验"
+        : `存在 ${errors.length} 个日期 / 产品错误，未生成回测结果（数据均未改动）`;
+    } else {
+      status.textContent = summaryError(e, "通票回测请求失败");
+    }
+    status.className = "status bad";
+    toast("无法执行通票回测", false);
+  }
+}
+
 /* ---------------- 演示数据 ---------------- */
 
 const DEMO = {
@@ -1518,6 +1649,10 @@ F006, 2026-09-18 08:04:00, 科技园, 进
 F006, 2026-09-18 08:30:00, 中心公园, 出
 G007, 2026-09-18 08:07:00, 科技园, 进
 G007, 2026-09-18 08:40:00, 大学城, 出`,
+  passes: `一日票, 6.00, 1
+三日票, 15.00, 3`,
+  pass_start: "2026-09-18",
+  pass_end: "2026-09-18",
 };
 
 async function loadDemo() {
@@ -1529,6 +1664,9 @@ async function loadDemo() {
   $("stations-text").value = DEMO.stations;
   $("fares-text").value = DEMO.fares;
   $("records-text").value = DEMO.records;
+  $("pass-text").value = DEMO.passes;
+  $("pass-start").value = DEMO.pass_start;
+  $("pass-end").value = DEMO.pass_end;
 
   await saveConfig();
   await putText("/api/stations", DEMO.stations);
@@ -1593,6 +1731,7 @@ function bind() {
   $("btn-od-csv").addEventListener("click", exportOdCsv);
   $("btn-gate-queue").addEventListener("click", runGateQueue);
   $("btn-gq-csv").addEventListener("click", exportGqCsv);
+  $("btn-pass").addEventListener("click", runPassBacktest);
   $("btn-verify").addEventListener("click", runVerify);
   $("btn-verify-top").addEventListener("click", runVerify);
   $("btn-demo").addEventListener("click", loadDemo);
@@ -1608,6 +1747,8 @@ async function init() {
   $("od-start").value = `${yyyy}-${mm}-${dd}`;
   $("od-end").value = `${yyyy}-${mm}-${dd}`;
   $("gq-day").value = `${yyyy}-${mm}-${dd}`;
+  $("pass-start").value = `${yyyy}-${mm}-${dd}`;
+  $("pass-end").value = `${yyyy}-${mm}-${dd}`;
   try {
     const cfg = await loadConfig();
     fillTrialInputs(cfg);

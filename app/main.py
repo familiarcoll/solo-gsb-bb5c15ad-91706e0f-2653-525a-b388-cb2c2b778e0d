@@ -19,8 +19,10 @@ from .core import (
     gate_queue_sim,
     od_flow_publish,
     parse_fares_text,
+    parse_passes_text,
     parse_records_text,
     parse_stations_text,
+    pass_backtest,
     repair_preview,
     station_peak_audit,
     trial_compare,
@@ -32,6 +34,7 @@ from .schemas import (
     GateQueueIn,
     MergePreviewIn,
     OdPublishIn,
+    PassBacktestIn,
     PeakAuditIn,
     TextIn,
     TrialConfigIn,
@@ -50,7 +53,7 @@ app = FastAPI(
     title="公交刷卡票价核验台",
     description="录入站点分区、票价矩阵、换乘抵扣、每日封顶与刷卡记录，"
                 "按卡号配对进出站并核验计价。",
-    version="1.6.0",
+    version="1.7.0",
     lifespan=lifespan,
 )
 
@@ -530,6 +533,55 @@ def run_gate_queue_sim(body: GateQueueIn):
         "group_count": result.group_count,
         "uncleared_count": result.uncleared_count,
         "groups": result.groups,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 通票购买策略回测（只读：基于最近一次核验账单，不改任何数据）
+# ---------------------------------------------------------------------------
+
+@app.post("/api/pass-backtest")
+def run_pass_backtest(body: PassBacktestIn):
+    """基于最近一次核验生成的账单，回测每张卡的最优通票购买序列。
+
+    - 通票产品以文本录入（每行：名称, 价格, 连续有效运营日数），行级
+      解析错误按 PASS_BAD_* 定位错误返回（行号指向产品文本）；
+    - 通票自选定运营日起连续覆盖其有效运营日内的全部行程，不因中间
+      无行程暂停；按卡号用动态规划求「通票费 + 未覆盖按次实扣」最低
+      的购买序列，同价时依次选择通票更少、首次购买日更早、名称字典序
+      更小的方案；
+    - 无有效账单（NO_BILLS）、日期非法（CONFIG_BAD）或产品非法
+      （PASS_*）时返回 422 与定位错误；
+    - 全程只读：不修改记录、配置，也不写入或清空账单。
+    """
+    passes, parse_errors = parse_passes_text(body.passes_text)
+    if parse_errors:
+        return _parse_error_response(parse_errors)
+    with db.connect() as conn:
+        bills = db.list_bills(conn)
+        last = db.get_meta(conn, "last_verified_at")
+    result = pass_backtest(bills, passes, body.start_day, body.end_day, last)
+
+    if not result.ok:
+        return JSONResponse(
+            status_code=422,
+            content={"ok": False, "errors": result.errors})
+
+    return {
+        "ok": True,
+        "start_day": result.start_day,
+        "end_day": result.end_day,
+        "day_count": result.day_count,
+        "last_verified_at": last,
+        "trip_count": result.trip_count,
+        "card_count": result.card_count,
+        "baseline_total": result.baseline_total,
+        "pass_cost_total": result.pass_cost_total,
+        "uncovered_total": result.uncovered_total,
+        "pass_total": result.pass_total,
+        "saving_total": result.saving_total,
+        "passes": result.passes,
+        "cards": result.cards,
     }
 
 
