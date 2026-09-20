@@ -572,6 +572,61 @@ X999, 2026-09-18 08:10:00, 中心公园, 进"></textarea>
       </div>
     </section>
 
+    <!-- 通票购买策略回测 -->
+    <section class="card" id="sec-pass-backtest">
+      <h2>14. 通票购买策略回测</h2>
+      <p class="hint">录入若干<strong>通票产品</strong>（每行 <code>名称, 价格, 连续有效运营日数</code>）并选择
+        <strong>运营日起止</strong>（闭区间），系统基于<strong>最近一次核验生成的账单</strong>，按卡号比较
+        <strong>按次实扣</strong>（已含换乘抵扣与当日封顶）与<strong>购买通票</strong>：通票自选定运营日起
+        覆盖其连续有效运营日内（按自然运营日连续计算，<strong>不因中间无行程暂停</strong>）该卡全部行程；
+        用<strong>动态规划</strong>求每张卡总支出最低的购买序列，同价时依次选择<strong>通票更少、首次购买日
+        更早、名称字典序更小</strong>的方案。结果展示基准支出、通票支出、节省额与逐次购买明细。
+        回测<strong>全程只读</strong>：不修改记录、配置或账单；请先在第 7 区成功核验生成账单。</p>
+      <p class="hint">每行格式 <code>名称, 价格（元）, 连续有效运营日数（正整数）</code>，例如
+        <code>日通票, 8.00, 1</code>；分隔符支持逗号、制表符、分号、空白与全角逗号，<code>#</code> 开头为注释，
+        通票名称不可重复。</p>
+      <textarea id="pass-text" rows="6" placeholder="日通票, 8.00, 1
+三日通票, 20.00, 3
+周通票, 45.00, 7"></textarea>
+      <div class="form-grid">
+        <label>运营日起始日期（含）
+          <input type="date" id="pass-start" />
+        </label>
+        <label>运营日结束日期（含）
+          <input type="date" id="pass-end" />
+        </label>
+      </div>
+      <div class="row-actions">
+        <button class="btn btn-primary" id="btn-pass-backtest" type="button">🎫 运行通票回测</button>
+        <span id="pass-status" class="status"></span>
+      </div>
+
+      <div id="pass-errors" class="errors-panel" hidden>
+        <h3>❌ 无法执行通票回测 —— 请先处理以下问题（记录、配置与账单均未改动）</h3>
+        <ul id="pass-errors-list"></ul>
+      </div>
+
+      <div id="pass-result" class="audit-result" hidden>
+        <div id="pass-summary" class="audit-summary"></div>
+
+        <div class="table-wrap">
+          <table id="pass-cards-table">
+            <thead>
+              <tr>
+                <th>卡号</th><th>行程数</th><th>出行运营日</th>
+                <th>按次基准支出</th><th>通票支出</th>
+                <th>其中：通票价</th><th>其中：剩余按次</th>
+                <th>通票张数</th><th>节省额</th><th>策略</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+
+        <div id="pass-cards-detail"></div>
+      </div>
+    </section>
+
     <footer class="footer">
       FastAPI + SQLite + 原生前端 · 数据保存在容器 /data 卷 ·
       <a href="/docs" target="_blank">API 文档</a>

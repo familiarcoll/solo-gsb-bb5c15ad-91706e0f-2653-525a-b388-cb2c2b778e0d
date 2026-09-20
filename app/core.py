@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import bisect
 import heapq
 import math
 import re
@@ -2254,4 +2255,364 @@ def gate_queue_sim(records: list[Swipe],
         group_count=len(groups),
         uncleared_count=sum(1 for g in groups if not g["cleared"]),
         groups=groups,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 通票购买策略回测（只读：基于最近一次核验生成的账单，不写任何数据）
+# ---------------------------------------------------------------------------
+
+PASS_DAY_FMT = "%Y-%m-%d"
+
+
+@dataclass
+class PassProduct:
+    """一种可购买的通票。
+
+    valid_days 为连续有效**运营日**数（自然日）：通票自选定运营日起
+    覆盖该运营日及其后连续 valid_days-1 个运营日内的全部行程，
+    中间没有行程也不暂停。
+    """
+    name: str
+    price: float          # 元，保留两位
+    valid_days: int
+    line: int = 1         # 录入文本行号（错误定位用）
+
+
+@dataclass
+class PassBacktest:
+    """通票购买策略回测结果。
+
+    ok=False 时 errors 携带原有定位错误：无任何账单 NO_BILLS、所选运营日
+    范围内无行程 NO_BILLS_IN_RANGE，日期 / 通票产品非法 CONFIG_BAD /
+    PASS_*（由调用方先行解析，核心层同样校验一遍日期）。
+    ok=True 时 cards 按卡号升序给出每卡的按次基准支出、最优通票支出、
+    节省额、逐次购买明细与逐程支付方式；batch_* 为全批次合计。
+    """
+    ok: bool
+    start_day: str = ""
+    end_day: str = ""
+    last_verified_at: Optional[str] = None
+    card_count: int = 0
+    batch_baseline: float = 0.0
+    batch_pass: float = 0.0
+    batch_saving: float = 0.0
+    batch_baseline_cents: int = 0
+    batch_pass_cents: int = 0
+    products: list[dict] = field(default_factory=list)
+    cards: list[dict] = field(default_factory=list)
+    errors: list[dict] = field(default_factory=list)
+
+
+def parse_passes_text(text: str) -> tuple[list[PassProduct], list[dict]]:
+    """通票产品文本，每行：名称, 价格, 连续有效运营日数。
+
+    与站点 / 票价录入一致：分隔符支持逗号、制表符、分号、空白与全角逗号；
+    空行与 `#` 开头的注释行忽略；名称不可重复，价格为不小于 0 的数字，
+    有效运营日数为正整数。
+    """
+    products: list[PassProduct] = []
+    errors: list[dict] = []
+    seen: set[str] = set()
+    for i, raw in enumerate((text or "").splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = _split(line)
+        if len(parts) != 3:
+            errors.append(_err(
+                "PASS_BAD_FIELDS",
+                f"通票行应为「名称, 价格, 连续有效运营日数」，实际 "
+                f"{len(parts)} 段：{line}",
+                line=i))
+            continue
+        name, price_text, days_text = parts[0], parts[1], parts[2]
+        if name in seen:
+            errors.append(_err("PASS_DUPLICATE",
+                               f"通票 {name} 重复定义", line=i))
+            continue
+        try:
+            price = _parse_amount(price_text, "通票价格")
+            days = _parse_int(days_text, "连续有效运营日数")
+        except ValueError as ex:
+            errors.append(_err("PASS_BAD_VALUE", str(ex), line=i))
+            continue
+        if days <= 0:
+            errors.append(_err(
+                "PASS_BAD_VALUE",
+                f"连续有效运营日数必须为正整数：{days_text!r}", line=i))
+            continue
+        products.append(PassProduct(name=name, price=price,
+                                    valid_days=days, line=i))
+        seen.add(name)
+    return products, errors
+
+
+def _parse_pass_day(value, label: str) -> tuple[Optional[str], Optional[dict]]:
+    """解析回测运营日参数（YYYY-MM-DD）；失败返回 CONFIG_BAD 定位错误。"""
+    text = str(value).strip()
+    try:
+        datetime.strptime(text, PASS_DAY_FMT)
+    except (ValueError, TypeError):
+        return None, _err(
+            "CONFIG_BAD",
+            f"运营日{label}必须是 YYYY-MM-DD 格式的日期：{value!r}")
+    return text, None
+
+
+def _add_days(day_text: str, delta: int) -> str:
+    d = datetime.strptime(day_text, PASS_DAY_FMT).date()
+    return (d + timedelta(days=delta)).strftime(PASS_DAY_FMT)
+
+
+def _optimal_pass_plan(days: list[str],
+                       day_cost: dict[str, int],
+                       products: list[PassProduct]
+                       ) -> tuple[int, list[dict]]:
+    """单卡通票购买序列优化（动态规划，整数分）。
+
+    days 为该卡在所选运营日范围内有行程的运营日（升序，字符串日期可
+    直接比较）；day_cost 为每个运营日的按次实扣合计（整数分）；
+    products 已按名称排序。只允许在有行程的运营日购买通票
+    （在无行程日购买只会更晚覆盖，不可能更优）。
+
+    同分裁决为「总价 → 通票数 → 首次购买日 → 购买序列名称字典序」。
+    其中「首次购买日」只由**第一张**通票决定，与之后的后缀无关，因此
+    拆成两个状态分别递推：
+
+    - g[i]：前序一张通票都没买时，覆盖第 i..n-1 个行程日的最优键
+      `(总支出, 通票数, 首次购买日, 名称序列, 购买日序列)`（首次购买日
+      可能为空串）；
+    - h[i]：前序**已有**通票（首次购买日已被前序锁定）时的最优键
+      `(总支出, 通票数, 名称序列, 购买日序列)`——后缀购买日不再影响
+      首次购买日，只按支出、张数与名称序列（与固定前缀拼接后字典序
+      不变）比较。
+
+    每步在「当日按次」与「购买每种通票（跳到覆盖结束后的首个行程日 +
+    票价）」之间取最小；购买转移的后缀一律用 h（该购买之后已有通票），
+    按次转移沿用各自状态。Python 元组比较天然实现全部同分裁决；末尾的
+    购买日序列仅在上述准则全部并列时让结果确定（选购买日更早的方案），
+    不影响规格规定的四级裁决。
+
+    返回 (最低总支出分, 购买明细列表)。
+    """
+    n = len(days)
+    # jump[i]：第 i 个运营日购买 valid_days 期通票后，下一个未被覆盖
+    # 的行程日下标（覆盖连续运营日 [days[i], days[i] + valid_days)）。
+    jump_by_product: dict[str, list[int]] = {}
+    for p in products:
+        jumps = [0] * n
+        for i, d in enumerate(days):
+            cover_end = _add_days(d, p.valid_days)
+            jumps[i] = bisect.bisect_left(days, cover_end)
+        jump_by_product[p.name] = jumps
+
+    # h：前序已有通票；g：前序无通票
+    h: list[tuple] = [(0, 0, (), ())] * (n + 1)
+    g: list[tuple] = [(0, 0, "", (), ())] * (n + 1)
+    choice_h: list[Optional[tuple[str, int]]] = [None] * n
+    choice_g: list[Optional[tuple[str, int]]] = [None] * n
+    for i in range(n - 1, -1, -1):
+        pay = day_cost[days[i]]
+
+        # h[i]：首次购买日不参与，只比 (支出, 张数, 名称序列, 购买日序列)
+        best_h: tuple = (h[i + 1][0] + pay, h[i + 1][1],
+                         h[i + 1][2], h[i + 1][3])
+        choice_h[i] = None
+        # g[i]：按次转移沿用 g（仍未购买任何通票）
+        best_g: tuple = (g[i + 1][0] + pay, g[i + 1][1],
+                         g[i + 1][2], g[i + 1][3], g[i + 1][4])
+        choice_g[i] = None
+        for p in products:
+            j = jump_by_product[p.name][i]
+            price = _cents_of(p.price)
+            tail_h = h[j]
+            cand_h = (tail_h[0] + price, tail_h[1] + 1,
+                      (p.name,) + tail_h[2], (days[i],) + tail_h[3])
+            if cand_h < best_h:
+                best_h = cand_h
+                choice_h[i] = (p.name, j)
+            # 这是整个序列的第一张通票：首次购买日 = days[i]，
+            # 后缀已有通票，用 h[j]。
+            cand_g = (tail_h[0] + price, tail_h[1] + 1,
+                      days[i], (p.name,) + tail_h[2],
+                      (days[i],) + tail_h[3])
+            if cand_g < best_g:
+                best_g = cand_g
+                choice_g[i] = (p.name, j)
+        h[i] = best_h
+        g[i] = best_g
+
+    # 沿最优选择重构购买序列（按下标推进；第一张通票之后转入 h 路径）
+    purchases: list[dict] = []
+    i = 0
+    seq = 0
+    has_pass_before = False
+    product_of = {p.name: p for p in products}
+    while i < n:
+        ch = choice_h[i] if has_pass_before else choice_g[i]
+        if ch is None:
+            i += 1
+            continue
+        name, j = ch
+        p = product_of[name]
+        seq += 1
+        covered = days[i:j]
+        cover_to = _add_days(days[i], p.valid_days - 1)
+        covered_fare = sum(day_cost[d] for d in covered)
+        purchases.append({
+            "seq": seq,
+            "name": name,
+            "price": _yuan_of(_cents_of(p.price)),
+            "price_cents": _cents_of(p.price),
+            "valid_days": p.valid_days,
+            "buy_day": days[i],
+            "cover_from": days[i],
+            "cover_to": cover_to,
+            "covered_trip_days": len(covered),
+            "covered_fare": _yuan_of(covered_fare),
+            "covered_fare_cents": covered_fare,
+            "saving": _yuan_of(covered_fare - _cents_of(p.price)),
+            "saving_cents": covered_fare - _cents_of(p.price),
+        })
+        has_pass_before = True
+        i = j
+    return g[0][0], purchases
+
+
+def pass_backtest(bills: list[dict],
+                  products: list[PassProduct],
+                  start_day, end_day,
+                  last_verified_at: Optional[str] = None) -> PassBacktest:
+    """通票购买策略回测（全程只读：只读取最近一次核验生成的账单）。
+
+    - 基准支出按**卡号**取所选运营日闭区间内每张账单的实扣额
+      （charged_fare，已含换乘抵扣与当日封顶口径）合计；
+    - 通票自选定运营日（须为有行程的运营日）起覆盖其连续有效运营日内
+      该卡全部行程，不因中间无行程而暂停；用动态规划求每卡总支出最低的
+      购买序列，同价时依次选择通票更少、首次购买日更早、名称字典序更小
+      的方案；
+    - 无任何账单（尚未成功核验）或所选运营日范围内没有任何行程，以及
+      日期 / 产品非法时，返回原有定位错误，不产出回测结果。
+    """
+    errors: list[dict] = []
+    start_text, e1 = _parse_pass_day(start_day, "起始日期")
+    end_text, e2 = _parse_pass_day(end_day, "结束日期")
+    if e1 is not None:
+        errors.append(e1)
+    if e2 is not None:
+        errors.append(e2)
+    if start_text is not None and end_text is not None \
+            and start_text > end_text:
+        errors.append(_err(
+            "CONFIG_BAD",
+            f"运营日起始日期不能晚于结束日期：{start_text} ～ {end_text}"))
+    if not products:
+        errors.append(_err(
+            "PASS_EMPTY", "请至少录入一种通票（名称, 价格, 连续有效运营日数）"))
+    if errors:
+        return PassBacktest(ok=False, errors=errors)
+
+    if not bills:
+        return PassBacktest(ok=False, errors=[_err(
+            "NO_BILLS",
+            "当前没有任何核验账单：请先在「7. 核验结果」运行一次成功核验，"
+            "回测基于最近一次核验生成的账单")])
+
+    # 按卡号分组（bills 来自 list_bills，已按 card, seq 排序）
+    by_card: dict[str, list[dict]] = {}
+    for b in bills:
+        day = b["operating_day"]
+        if start_text <= day <= end_text:
+            by_card.setdefault(b["card"], []).append(b)
+
+    if not by_card:
+        return PassBacktest(ok=False, errors=[_err(
+            "NO_BILLS_IN_RANGE",
+            f"所选运营日范围 {start_text} ～ {end_text}（闭区间）内没有任何"
+            "账单行程，请先调整范围或重新核验")])
+
+    # 按名称排序：DP 的同分裁决与处理顺序无关，但稳定顺序便于复核
+    products_sorted = sorted(products, key=lambda p: p.name)
+    product_echo = [{
+        "name": p.name,
+        "price": _round2(p.price),
+        "valid_days": p.valid_days,
+    } for p in products_sorted]
+
+    cards: list[dict] = []
+    total_baseline = 0
+    total_pass = 0
+    for card in sorted(by_card):
+        card_bills = sorted(by_card[card], key=lambda b: b["seq"])
+        day_cost: dict[str, int] = {}
+        day_order: list[str] = []
+        for b in card_bills:
+            day = b["operating_day"]
+            if day not in day_cost:
+                day_cost[day] = 0
+                day_order.append(day)
+            day_cost[day] += _cents_of(b["charged_fare"])
+        baseline_cents = sum(day_cost.values())
+
+        pass_total_cents, purchases = _optimal_pass_plan(
+            day_order, day_cost, products_sorted)
+
+        # 逐程支付方式：落在任一已购通票覆盖区间内则由该通票支付
+        trip_rows: list[dict] = []
+        for b in card_bills:
+            day = b["operating_day"]
+            owner = next((p for p in purchases
+                         if p["cover_from"] <= day <= p["cover_to"]), None)
+            charged = _cents_of(b["charged_fare"])
+            trip_rows.append({
+                "seq": b["seq"],
+                "operating_day": day,
+                "entry_time": b["entry_time"],
+                "exit_time": b["exit_time"],
+                "entry_station": b["entry_station"],
+                "exit_station": b["exit_station"],
+                "charged_fare": _yuan_of(charged),
+                "charged_fare_cents": charged,
+                "pay_method": "pass" if owner is not None else "per_ride",
+                "pass_name": owner["name"] if owner is not None else None,
+                "pass_seq": owner["seq"] if owner is not None else None,
+            })
+
+        covered_cents = sum(p["covered_fare_cents"] for p in purchases)
+        per_ride_cents = baseline_cents - covered_cents
+        saving_cents = baseline_cents - pass_total_cents
+        cards.append({
+            "card": card,
+            "trip_count": len(card_bills),
+            "trip_day_count": len(day_order),
+            "baseline_total": _yuan_of(baseline_cents),
+            "baseline_total_cents": baseline_cents,
+            "pass_total": _yuan_of(pass_total_cents),
+            "pass_total_cents": pass_total_cents,
+            "pass_cost": _yuan_of(sum(p["price_cents"] for p in purchases)),
+            "per_ride_remaining": _yuan_of(per_ride_cents),
+            "saving": _yuan_of(saving_cents),
+            "saving_cents": saving_cents,
+            "pass_count": len(purchases),
+            "use_pass": bool(purchases),
+            "purchases": purchases,
+            "trips": trip_rows,
+        })
+        total_baseline += baseline_cents
+        total_pass += pass_total_cents
+
+    return PassBacktest(
+        ok=True,
+        start_day=start_text,
+        end_day=end_text,
+        last_verified_at=last_verified_at,
+        card_count=len(cards),
+        batch_baseline=_yuan_of(total_baseline),
+        batch_pass=_yuan_of(total_pass),
+        batch_saving=_yuan_of(total_baseline - total_pass),
+        batch_baseline_cents=total_baseline,
+        batch_pass_cents=total_pass,
+        products=product_echo,
+        cards=cards,
     )

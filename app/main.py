@@ -19,8 +19,10 @@ from .core import (
     gate_queue_sim,
     od_flow_publish,
     parse_fares_text,
+    parse_passes_text,
     parse_records_text,
     parse_stations_text,
+    pass_backtest,
     repair_preview,
     station_peak_audit,
     trial_compare,
@@ -32,6 +34,7 @@ from .schemas import (
     GateQueueIn,
     MergePreviewIn,
     OdPublishIn,
+    PassBacktestIn,
     PeakAuditIn,
     TextIn,
     TrialConfigIn,
@@ -50,7 +53,7 @@ app = FastAPI(
     title="公交刷卡票价核验台",
     description="录入站点分区、票价矩阵、换乘抵扣、每日封顶与刷卡记录，"
                 "按卡号配对进出站并核验计价。",
-    version="1.6.0",
+    version="1.7.0",
     lifespan=lifespan,
 )
 
@@ -530,6 +533,52 @@ def run_gate_queue_sim(body: GateQueueIn):
         "group_count": result.group_count,
         "uncleared_count": result.uncleared_count,
         "groups": result.groups,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 通票购买策略回测（只读：基于最近一次核验账单，不改记录、配置或账单）
+# ---------------------------------------------------------------------------
+
+@app.post("/api/pass-backtest")
+def run_pass_backtest(body: PassBacktestIn):
+    """基于最近一次核验生成的账单，回测通票购买策略。
+
+    - 页面录入若干通票（名称、价格、连续有效运营日数）与运营日起止
+      （闭区间）；通票自选定运营日起覆盖其连续有效运营日内该卡全部行程，
+      不因中间无行程暂停；
+    - 按卡号比较按次实扣（账单 charged_fare）与购买通票：动态规划求每张卡
+      总支出最低的购买序列，同价时依次选择通票更少、首次购买日更早、
+      名称字典序更小的方案；展示基准支出、通票支出、节省额与逐次购买明细；
+    - 无有效账单（尚未核验 / 范围内无行程）、日期或通票产品非法时返回
+      422 与明确定位错误；全程只读：不修改记录、配置，也不写入或清空账单。
+    """
+    products, parse_errors = parse_passes_text(body.text)
+    if parse_errors:
+        return _parse_error_response(parse_errors)
+    with db.connect() as conn:
+        bills = db.list_bills(conn)
+        last = db.get_meta(conn, "last_verified_at")
+        result = pass_backtest(bills, products,
+                               body.start_day, body.end_day,
+                               last_verified_at=last)
+
+    if not result.ok:
+        return JSONResponse(
+            status_code=422,
+            content={"ok": False, "errors": result.errors})
+
+    return {
+        "ok": True,
+        "start_day": result.start_day,
+        "end_day": result.end_day,
+        "last_verified_at": result.last_verified_at,
+        "products": result.products,
+        "card_count": result.card_count,
+        "batch_baseline": result.batch_baseline,
+        "batch_pass": result.batch_pass,
+        "batch_saving": result.batch_saving,
+        "cards": result.cards,
     }
 
 

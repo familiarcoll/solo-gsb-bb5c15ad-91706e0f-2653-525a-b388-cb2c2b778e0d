@@ -1480,6 +1480,170 @@ function exportGqCsv() {
   toast("已导出逐桶排队推演结果（CSV，UTF-8 BOM）");
 }
 
+/* ---------------- 14. 通票购买策略回测（只读） ---------------- */
+
+function renderPassErrors(errors) {
+  const ul = $("pass-errors-list");
+  ul.innerHTML = "";
+  for (const e of errors) ul.appendChild(renderErrorLi(e));
+  $("pass-errors").hidden = false;
+  $("pass-result").hidden = true;
+}
+
+function renderPassBacktest(data) {
+  $("pass-errors").hidden = true;
+  $("pass-result").hidden = false;
+
+  const productsText = (data.products || []).map((p) =>
+    `${escapeHtml(p.name)}（${yuan(p.price)} 元 / ${p.valid_days} 运营日）`
+  ).join("、");
+  $("pass-summary").innerHTML =
+    `运营日 <strong>${data.start_day} ～ ${data.end_day}</strong>（闭区间）· ` +
+    `通票：${productsText} · 参与回测 <strong>${data.card_count}</strong> 张卡` +
+    (data.last_verified_at
+      ? `<span class="sub">（账单来自最近一次核验：${data.last_verified_at}）</span>`
+      : "") +
+    `<br>全批次按次基准支出 <strong>${yuan(data.batch_baseline)}</strong> 元 → ` +
+    `最优通票策略支出 <strong>${yuan(data.batch_pass)}</strong> 元，` +
+    `<span class="${data.batch_saving > 0 ? "delta-down" : "delta-zero"}">` +
+    `合计节省 <strong>${yuan(data.batch_saving)}</strong> 元</span>。<br>` +
+    `<span class="sub">动态规划求每卡总支出最低的购买序列；总价相同时依次选择通票更少、` +
+    `首次购买日更早、名称字典序更小的方案；通票按连续运营日覆盖、不因中间无行程暂停。` +
+    `回测全程只读，记录 / 配置 / 账单均未改动。</span>`;
+
+  const tb = $("pass-cards-table").querySelector("tbody");
+  tb.innerHTML = "";
+  for (const c of data.cards) {
+    const tr = document.createElement("tr");
+    const savingCls = c.saving > 0 ? "delta-down"
+      : c.saving < 0 ? "delta-up" : "delta-zero";
+    tr.innerHTML = `
+      <td>${escapeHtml(c.card)}</td>
+      <td class="num">${c.trip_count}</td>
+      <td class="num">${c.trip_day_count}</td>
+      <td class="num">${yuan(c.baseline_total)}</td>
+      <td class="num charge">${yuan(c.pass_total)}</td>
+      <td class="num">${yuan(c.pass_cost)}</td>
+      <td class="num">${yuan(c.per_ride_remaining)}</td>
+      <td class="num">${c.pass_count}</td>
+      <td class="num ${savingCls}">${c.saving > 0 ? "−" : ""}${yuan(c.saving)}</td>
+      <td>${c.use_pass
+        ? `通票 + 按次（购 ${c.pass_count} 张）`
+        : '<span class="tag tag-cur">全程按次</span>'}</td>`;
+    tb.appendChild(tr);
+  }
+
+  // 每卡明细：逐次购买 + 逐程支付方式
+  const box = $("pass-cards-detail");
+  box.innerHTML = "";
+  for (const c of data.cards) {
+    const div = document.createElement("div");
+    div.className = "gq-group";
+    let html = `<h3><span class="gq-station">卡号 ${escapeHtml(c.card)}</span>` +
+      `<span class="tag tag-draft">${c.trip_count} 程 / ${c.trip_day_count} 个运营日</span></h3>` +
+      `<div class="gq-group-meta">按次基准 <strong>${yuan(c.baseline_total)}</strong> 元 · ` +
+      `通票策略 <strong>${yuan(c.pass_total)}</strong> 元` +
+      `（通票价 ${yuan(c.pass_cost)} ＋ 剩余按次 ${yuan(c.per_ride_remaining)}）· `;
+    html += c.saving > 0
+      ? `<span class="delta-down">节省 <strong>${yuan(c.saving)}</strong> 元</span>`
+      : `<span class="delta-zero">节省 0.00 元（最优策略即全程按次，不购买通票）</span>`;
+    html += `</div>`;
+
+    if (c.use_pass) {
+      html += `<h3>逐次购买明细</h3><div class="table-wrap"><table class="gq-table">` +
+        `<thead><tr><th>#</th><th>通票</th><th>购买日</th>` +
+        `<th>覆盖运营日（连续）</th><th>有效期(运营日)</th><th>覆盖有行程日</th>` +
+        `<th>覆盖行程按次合计</th><th>票价</th><th>净省</th></tr></thead><tbody>`;
+      for (const p of c.purchases) {
+        const win = p.cover_from === p.cover_to
+          ? p.cover_from
+          : `${p.cover_from} ～ ${p.cover_to}`;
+        const net = p.saving_cents > 0
+          ? `<span class="delta-down">−${yuan(p.saving)}</span>`
+          : `<span class="delta-zero">${yuan(p.saving)}</span>`;
+        html += `<tr><td class="num">${p.seq}</td>` +
+          `<td><span class="tag tag-draft">${escapeHtml(p.name)}</span></td>` +
+          `<td>${p.buy_day}</td><td>${win}</td>` +
+          `<td class="num">${p.valid_days}</td>` +
+          `<td class="num">${p.covered_trip_days}</td>` +
+          `<td class="num">${yuan(p.covered_fare)}</td>` +
+          `<td class="num">${yuan(p.price)}</td>` +
+          `<td class="num">${net}</td></tr>`;
+      }
+      html += `</tbody></table></div>`;
+    }
+
+    html += `<h3>逐程支付方式</h3><div class="table-wrap"><table class="gq-table">` +
+      `<thead><tr><th>#</th><th>运营日</th><th>进站时刻</th><th>出站时刻</th>` +
+      `<th>行程</th><th>按次实扣</th><th>支付方式</th></tr></thead><tbody>`;
+    for (const t of c.trips) {
+      const method = t.pay_method === "pass"
+        ? `<span class="tag tag-ok">通票</span> ` +
+          `${escapeHtml(t.pass_name)}（第 ${t.pass_seq} 张）`
+        : '<span class="tag tag-cur">按次</span>';
+      html += `<tr><td class="num">${t.seq}</td><td>${t.operating_day}</td>` +
+        `<td>${t.entry_time}</td><td>${t.exit_time}</td>` +
+        `<td>${escapeHtml(t.entry_station)} → ${escapeHtml(t.exit_station)}</td>` +
+        `<td class="num ${t.pay_method === "pass" ? "delta-zero" : "charge"}">` +
+        `${yuan(t.charged_fare)}</td><td>${method}</td></tr>`;
+    }
+    html += `</tbody></table></div>`;
+    div.innerHTML = html;
+    box.appendChild(div);
+  }
+}
+
+async function runPassBacktest() {
+  const status = $("pass-status");
+  const body = {
+    text: $("pass-text").value,
+    start_day: $("pass-start").value,
+    end_day: $("pass-end").value,
+  };
+  if (!body.start_day || !body.end_day) {
+    status.textContent = "请先选择运营日起止日期";
+    status.className = "status bad";
+    return;
+  }
+  status.textContent = "回测中…";
+  status.className = "status";
+  $("pass-errors").hidden = true;
+  $("pass-result").hidden = true;
+  try {
+    const data = await api("/api/pass-backtest", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    renderPassBacktest(data);
+    const buyers = data.cards.filter((c) => c.use_pass).length;
+    status.textContent =
+      `回测完成：${data.card_count} 张卡，${buyers} 张卡购买通票，` +
+      `全批次节省 ${yuan(data.batch_saving)} 元（只读，账单未改动）`;
+    status.className = "status ok";
+    toast("通票回测完成（只读，未保存任何改动）");
+  } catch (e) {
+    const errors = (e.payload && e.payload.errors) || [];
+    if (errors.length) {
+      renderPassErrors(errors);
+      if (errors[0].code === "NO_BILLS") {
+        status.textContent = "尚无核验账单，请先在第 7 区运行核验";
+      } else if (errors[0].code === "NO_BILLS_IN_RANGE") {
+        status.textContent = "所选运营日范围内没有账单行程";
+      } else if (errors[0].code === "PASS_EMPTY") {
+        status.textContent = "请至少录入一种通票";
+      } else if (errors[0].code && errors[0].code.startsWith("PASS_")) {
+        status.textContent = `通票录入存在 ${errors.length} 个错误，未生成回测`;
+      } else {
+        status.textContent = "参数不合法，未生成回测结果（数据均未改动）";
+      }
+    } else {
+      status.textContent = summaryError(e, "通票回测请求失败");
+    }
+    status.className = "status bad";
+    toast("无法执行通票回测", false);
+  }
+}
+
 /* ---------------- 演示数据 ---------------- */
 
 const DEMO = {
@@ -1593,6 +1757,7 @@ function bind() {
   $("btn-od-csv").addEventListener("click", exportOdCsv);
   $("btn-gate-queue").addEventListener("click", runGateQueue);
   $("btn-gq-csv").addEventListener("click", exportGqCsv);
+  $("btn-pass-backtest").addEventListener("click", runPassBacktest);
   $("btn-verify").addEventListener("click", runVerify);
   $("btn-verify-top").addEventListener("click", runVerify);
   $("btn-demo").addEventListener("click", loadDemo);
@@ -1608,6 +1773,10 @@ async function init() {
   $("od-start").value = `${yyyy}-${mm}-${dd}`;
   $("od-end").value = `${yyyy}-${mm}-${dd}`;
   $("gq-day").value = `${yyyy}-${mm}-${dd}`;
+  // 通票回测默认覆盖演示数据的运营日（2026-09-18 ～ 2026-09-19），
+  // 用户可自行调整为实际数据所在范围。
+  $("pass-start").value = "2026-09-18";
+  $("pass-end").value = "2026-09-19";
   try {
     const cfg = await loadConfig();
     fillTrialInputs(cfg);
